@@ -67,6 +67,7 @@ def _main(argv: Sequence[str]) -> None:
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
+  jax.config.update('jax_enable_compilation_cache', False)
   model_path = (
       epath.resource_path('mujoco.mjx')
       / 'test_data'
