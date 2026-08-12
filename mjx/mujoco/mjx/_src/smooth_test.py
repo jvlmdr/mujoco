@@ -20,6 +20,7 @@ import jax
 from jax import numpy as jp
 import mujoco
 from mujoco import mjx
+from mujoco.mjx._src import math
 from mujoco.mjx._src import test_util
 from mujoco.mjx._src.types import ConeType  # pylint: disable=g-importing-member
 from mujoco.mjx._src.types import JacobianType  # pylint: disable=g-importing-member
@@ -137,6 +138,182 @@ class SmoothTest(absltest.TestCase):
         d.moment_colind,
     )
     _assert_eq(moment, dx._impl.actuator_moment, 'actuator_moment')
+
+  def test_frame_pose(self):
+    m = mujoco.MjModel.from_xml_string("""
+        <mujoco>
+          <worldbody>
+            <body name="root">
+              <freejoint/>
+              <geom size="0.01" mass="1"/>
+              <body name="hinge" pos="0.1 -0.2 0.3" quat="0.9 0.1 0.2 -0.1">
+                <joint name="hinge_joint" type="hinge"
+                       pos="0.02 0.03 -0.04" axis="1 2 3"/>
+                <geom size="0.01" mass="1"/>
+                <body pos="0.05 0.06 0.07">
+                  <body name="slide" pos="-0.1 0.2 0.1">
+                    <joint name="slide_joint" type="slide" axis="-1 2 1"/>
+                    <geom size="0.01" mass="1"/>
+                    <body name="ball" pos="0.2 0.1 -0.1">
+                      <joint name="ball_joint" type="ball"
+                             pos="0.04 -0.02 0.01"/>
+                      <geom type="box" size="0.01 0.02 0.03" mass="1"
+                            pos="0.03 -0.02 0.01"
+                            quat="0.8 0.1 0.2 -0.3"/>
+                      <site name="tip" pos="0.1 -0.2 0.05"
+                            quat="0.8 0.2 -0.1 0.3"/>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+        """)
+    d = mujoco.MjData(m)
+    d.qpos[:] = m.qpos0
+    d.qpos[:7] = [0.2, -0.3, 0.5, 0.9, 0.1, -0.2, 0.3]
+    d.qpos[m.joint('hinge_joint').qposadr] = 0.7
+    d.qpos[m.joint('slide_joint').qposadr] = -0.15
+    ball_qposadr = int(m.joint('ball_joint').qposadr[0])
+    d.qpos[ball_qposadr : ball_qposadr + 4] = [0.8, 0.2, 0.1, -0.3]
+    mujoco.mj_forward(m, d)
+
+    mx = mjx.put_model(m)
+    dx = mjx.put_data(m, d)
+    frames = (
+        (mujoco.mjtObj.mjOBJ_BODY, 'ball'),
+        (mujoco.mjtObj.mjOBJ_XBODY, 'ball'),
+        (mujoco.mjtObj.mjOBJ_SITE, 'tip'),
+    )
+    for obj_type, obj_name in frames:
+      with self.subTest(obj_name=obj_name):
+        obj_id = mujoco.mj_name2id(m, obj_type, obj_name)
+        pose = jax.jit(
+            lambda model, data: mjx.frame_pose(model, data, obj_type, obj_id)
+        )
+        pos, quat = pose(mx, dx)
+
+        if obj_type == mujoco.mjtObj.mjOBJ_BODY:
+          expected_pos = d.xipos[obj_id]
+          expected_quat = np.empty(4)
+          mujoco.mju_mat2Quat(expected_quat, d.ximat[obj_id])
+        elif obj_type == mujoco.mjtObj.mjOBJ_XBODY:
+          expected_pos = d.xpos[obj_id]
+          expected_quat = d.xquat[obj_id]
+        else:
+          expected_pos = d.site_xpos[obj_id]
+          expected_quat = np.empty(4)
+          mujoco.mju_mat2Quat(expected_quat, d.site_xmat[obj_id])
+        _assert_eq(expected_pos, pos, 'frame position')
+        _assert_eq(expected_quat, quat, 'frame quaternion')
+
+        def frame_vector(qpos):
+          pos, quat = mjx.frame_pose(
+              mx, dx.replace(qpos=qpos), obj_type, obj_id
+          )
+          return jp.concatenate([pos, math.quat_to_mat(quat).reshape(-1)])
+
+        if obj_type == mujoco.mjtObj.mjOBJ_BODY:
+
+          def stock_vector(qpos):
+            data = mjx.kinematics(mx, dx.replace(qpos=qpos))
+            return jp.concatenate(
+                [data.xipos[obj_id], data.ximat[obj_id].reshape(-1)]
+            )
+
+        elif obj_type == mujoco.mjtObj.mjOBJ_XBODY:
+
+          def stock_vector(qpos):
+            data = mjx.kinematics(mx, dx.replace(qpos=qpos))
+            return jp.concatenate(
+                [data.xpos[obj_id], data.xmat[obj_id].reshape(-1)]
+            )
+
+        else:
+
+          def stock_vector(qpos):
+            data = mjx.kinematics(mx, dx.replace(qpos=qpos))
+            return jp.concatenate(
+                [data.site_xpos[obj_id], data.site_xmat[obj_id].reshape(-1)]
+            )
+
+        jacobian = jax.jacrev(frame_vector)(dx.qpos)
+        stock_jacobian = jax.jacrev(stock_vector)(dx.qpos)
+        self.assertEqual(jacobian.shape, (12, m.nq))
+        self.assertTrue(np.all(np.isfinite(jacobian)))
+        _assert_eq(stock_jacobian, jacobian, 'frame Jacobian')
+
+  def test_frame_pose_model_structures(self):
+    m = mujoco.MjModel.from_xml_string("""
+        <mujoco>
+          <worldbody>
+            <site name="world_site" pos="0.1 -0.2 0.3"/>
+            <body name="mocap" mocap="true">
+              <site name="mocap_site" pos="0.02 0.03 0.04"/>
+            </body>
+            <body name="root" pos="0.2 0.1 -0.1">
+              <joint name="root_hinge" type="hinge" axis="0 0 1"/>
+              <joint name="root_slide" type="slide" axis="1 0 0"/>
+              <geom size="0.01" mass="1"/>
+              <body name="target" pos="0.1 0.2 0.3">
+                <site name="target_site" pos="-0.1 0.05 0.02"/>
+              </body>
+              <body name="sibling" pos="-0.2 0.1 0.2">
+                <joint name="sibling_hinge" type="hinge" axis="0 1 0"/>
+                <geom size="0.01" mass="1"/>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+        """)
+    d = mujoco.MjData(m)
+    d.qpos[m.joint('root_hinge').qposadr] = 0.4
+    d.qpos[m.joint('root_slide').qposadr] = -0.2
+    d.qpos[m.joint('sibling_hinge').qposadr] = 0.7
+    d.mocap_pos[0] = [0.5, -0.4, 0.3]
+    d.mocap_quat[0] = [0.9, 0.1, -0.2, 0.3]
+    mujoco.mj_forward(m, d)
+    mx = mjx.put_model(m)
+    dx = mjx.put_data(m, d)
+
+    for obj_type, obj_name in (
+        (mujoco.mjtObj.mjOBJ_SITE, 'world_site'),
+        (mujoco.mjtObj.mjOBJ_SITE, 'mocap_site'),
+        (mujoco.mjtObj.mjOBJ_BODY, 'target'),
+        (mujoco.mjtObj.mjOBJ_XBODY, 'target'),
+        (mujoco.mjtObj.mjOBJ_SITE, 'target_site'),
+    ):
+      with self.subTest(obj_name=obj_name):
+        obj_id = mujoco.mj_name2id(m, obj_type, obj_name)
+        pos, quat = jax.jit(
+            lambda data: mjx.frame_pose(mx, data, obj_type, obj_id)
+        )(dx)
+        if obj_type == mujoco.mjtObj.mjOBJ_BODY:
+          expected_pos = d.xipos[obj_id]
+          expected_quat = np.empty(4)
+          mujoco.mju_mat2Quat(expected_quat, d.ximat[obj_id])
+        elif obj_type == mujoco.mjtObj.mjOBJ_XBODY:
+          expected_pos = d.xpos[obj_id]
+          expected_quat = d.xquat[obj_id]
+        else:
+          expected_pos = d.site_xpos[obj_id]
+          expected_quat = np.empty(4)
+          mujoco.mju_mat2Quat(expected_quat, d.site_xmat[obj_id])
+        _assert_eq(expected_pos, pos, 'frame position')
+        _assert_eq(expected_quat, quat, 'frame quaternion')
+
+    target_site_id = m.site('target_site').id
+    target_jacobian = jax.jacrev(
+        lambda qpos: mjx.frame_pose(
+            mx,
+            dx.replace(qpos=qpos),
+            mujoco.mjtObj.mjOBJ_SITE,
+            target_site_id,
+        )[0]
+    )(dx.qpos)
+    sibling_qposadr = int(m.joint('sibling_hinge').qposadr[0])
+    _assert_eq(target_jacobian[:, sibling_qposadr], 0.0, 'off-path Jacobian')
 
   def test_disable_gravity(self):
     m = mujoco.MjModel.from_xml_string("""
