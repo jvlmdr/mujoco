@@ -38,12 +38,240 @@ import mujoco.mjx.warp as mjxw
 import numpy as np
 
 
+def _kinematics_fixed_scalar_tree(m: Model, d: Data) -> Data:
+  """Computes every kinematic frame efficiently for a fixed model.
+
+  This path supports trees with at most one hinge or slide joint per body.
+  """
+
+  # explicit batch dimensions keep these operations compact when traced
+  def quat_mul(left, right):
+    left_scalar, left_vector = left[..., :1], left[..., 1:]
+    right_scalar, right_vector = right[..., :1], right[..., 1:]
+    return jp.concatenate(
+        (
+            left_scalar * right_scalar
+            - jp.sum(left_vector * right_vector, axis=-1, keepdims=True),
+            left_scalar * right_vector
+            + right_scalar * left_vector
+            + jp.cross(left_vector, right_vector),
+        ),
+        axis=-1,
+    )
+
+  def rotate(vec, quat):
+    scalar, vector = quat[..., :1], quat[..., 1:]
+    result = 2 * jp.sum(vector * vec, axis=-1, keepdims=True) * vector
+    result += (
+        scalar * scalar - jp.sum(vector * vector, axis=-1, keepdims=True)
+    ) * vec
+    return result + 2 * scalar * jp.cross(vector, vec)
+
+  def quat_to_mat(quat):
+    w, x, y, z = jp.moveaxis(quat, -1, 0)
+    elements = (
+        w * w + x * x - y * y - z * z,
+        2 * (x * y - w * z),
+        2 * (x * z + w * y),
+        2 * (x * y + w * z),
+        w * w - x * x + y * y - z * z,
+        2 * (y * z - w * x),
+        2 * (x * z - w * y),
+        2 * (y * z + w * x),
+        w * w - x * x - y * y + z * z,
+    )
+    return jp.stack(elements, axis=-1).reshape(quat.shape[:-1] + (3, 3))
+
+  body_parentid = np.asarray(m.body_parentid)
+  has_joint = np.asarray(m.body_jntnum, dtype=bool)
+  body_joint_ids = np.zeros(m.nbody, dtype=np.int32)
+  body_joint_ids[has_joint] = np.asarray(m.body_jntadr)[has_joint]
+  joint_bodies = np.asarray(m.jnt_bodyid)
+
+  qpos_adrs = np.asarray(m.jnt_qposadr)[body_joint_ids]
+  joint_kinds = np.asarray(m.jnt_type)[body_joint_ids]
+  joint_pos = m.jnt_pos[body_joint_ids]
+  joint_axis = m.jnt_axis[body_joint_ids]
+  displacement = d.qpos[qpos_adrs] - m.qpos0[qpos_adrs]
+  anchor = m.body_pos + rotate(joint_pos, m.body_quat)
+  axis = rotate(joint_axis, m.body_quat)
+  is_slide = joint_kinds == JointType.SLIDE
+
+  def local_poses(
+      displacement,
+      body_pos,
+      body_quat,
+      joint_pos,
+      joint_axis,
+      anchor,
+      axis,
+  ):
+    half_angle = displacement / 2
+    joint_quat = jp.concatenate(
+        (jp.cos(half_angle[:, None]), joint_axis * jp.sin(half_angle[:, None])),
+        axis=1,
+    )
+    hinge_quat = quat_mul(body_quat, joint_quat)
+    hinge_pos = anchor - rotate(joint_pos, hinge_quat)
+    slide_pos = body_pos + axis * displacement[:, None]
+    pos = jp.where(is_slide[:, None], slide_pos, hinge_pos)
+    quat = jp.where(is_slide[:, None], body_quat, hinge_quat)
+    pos = jp.where(has_joint[:, None], pos, body_pos)
+    quat = jp.where(has_joint[:, None], quat, body_quat)
+    return pos, quat
+
+  depths = np.zeros(m.nbody, dtype=np.int32)
+  for body_id in range(1, m.nbody):
+    depths[body_id] = depths[body_parentid[body_id]] + 1
+  jump_count = int(np.ceil(np.log2(max(int(np.max(depths)), 1))))
+
+  def world_poses_primal(pos, quat):
+    parents = body_parentid
+    # each round doubles the number of ancestors represented by each pose
+    for _ in range(jump_count):
+      parent_pos = pos[parents]
+      parent_quat = quat[parents]
+      pos = parent_pos + rotate(pos, parent_quat)
+      quat = quat_mul(parent_quat, quat)
+      parents = parents[parents]
+    return pos, quat
+
+  ancestors = np.zeros((m.nbody, m.nbody), dtype=bool)
+  for body_id in range(m.nbody):
+    ancestor_id = body_id
+    while True:
+      ancestors[body_id, ancestor_id] = True
+      if ancestor_id == 0:
+        break
+      ancestor_id = body_parentid[ancestor_id]
+  active = ancestors & has_joint[None, :]
+
+  @jax.custom_jvp
+  def world_poses(
+      displacement,
+      body_pos,
+      body_quat,
+      joint_pos,
+      joint_axis,
+      anchor,
+      axis,
+  ):
+    local = local_poses(
+        displacement,
+        body_pos,
+        body_quat,
+        joint_pos,
+        joint_axis,
+        anchor,
+        axis,
+    )
+    return world_poses_primal(*local)
+
+  @world_poses.defjvp
+  def world_poses_jvp(primals, tangents):
+    (
+        displacement,
+        body_pos,
+        body_quat,
+        joint_pos,
+        joint_axis,
+        anchor,
+        axis,
+    ) = primals
+    displacement_tangent = tangents[0]
+    local = local_poses(
+        displacement,
+        body_pos,
+        body_quat,
+        joint_pos,
+        joint_axis,
+        anchor,
+        axis,
+    )
+    xpos, xquat = world_poses_primal(*local)
+    parent_quat = xquat[body_parentid]
+    world_anchor = xpos[body_parentid] + rotate(anchor, parent_quat)
+    world_axis = rotate(axis, parent_quat)
+    # the geometric Jacobian avoids differentiating through pointer doubling
+    lever = xpos[:, None, :] - world_anchor[None, :, :]
+    hinge_velocity = jp.cross(world_axis[None, :, :], lever)
+    joint_velocity = jp.where(
+        is_slide[None, :, None], world_axis[None, :, :], hinge_velocity
+    )
+    weights = jp.asarray(active) * displacement_tangent[None, :]
+    xpos_tangent = jp.sum(weights[..., None] * joint_velocity, axis=1)
+    angular_velocity = jp.sum(
+        (weights * ~is_slide[None, :])[..., None] * world_axis[None, :, :],
+        axis=1,
+    )
+    pure_angular_velocity = jp.pad(angular_velocity, ((0, 0), (1, 0)))
+    xquat_tangent = 0.5 * quat_mul(pure_angular_velocity, xquat)
+    return (xpos, xquat), (xpos_tangent, xquat_tangent)
+
+  xpos, xquat = world_poses(
+      displacement,
+      m.body_pos,
+      m.body_quat,
+      joint_pos,
+      joint_axis,
+      anchor,
+      axis,
+  )
+  xmat = quat_to_mat(xquat)
+  joint_parent_ids = body_parentid[joint_bodies]
+  xanchor = xpos[joint_parent_ids] + rotate(
+      anchor[joint_bodies], xquat[joint_parent_ids]
+  )
+  xaxis = rotate(axis[joint_bodies], xquat[joint_parent_ids])
+
+  if m.nmocap:
+    xpos = xpos.at[m.body_mocapid >= 0].set(d.mocap_pos)
+    mocap_quat = jax.vmap(math.normalize)(d.mocap_quat)
+    xquat = xquat.at[m.body_mocapid >= 0].set(mocap_quat)
+    xmat = xmat.at[m.body_mocapid >= 0].set(quat_to_mat(mocap_quat))
+
+  def local_to_global(pos, quat, local_pos, local_quat):
+    return pos + rotate(local_pos, quat), quat_to_mat(
+        quat_mul(quat, local_quat)
+    )
+
+  xipos, ximat = local_to_global(xpos, xquat, m.body_ipos, m.body_iquat)
+  d = d.replace(xanchor=xanchor, xaxis=xaxis, xpos=xpos)
+  d = d.replace(xquat=xquat, xmat=xmat, xipos=xipos, ximat=ximat)
+
+  if m.ngeom:
+    geom_xpos, geom_xmat = local_to_global(
+        xpos[m.geom_bodyid], xquat[m.geom_bodyid], m.geom_pos, m.geom_quat
+    )
+    d = d.replace(geom_xpos=geom_xpos, geom_xmat=geom_xmat)
+
+  if m.nsite:
+    site_xpos, site_xmat = local_to_global(
+        xpos[m.site_bodyid], xquat[m.site_bodyid], m.site_pos, m.site_quat
+    )
+    d = d.replace(site_xpos=site_xpos, site_xmat=site_xmat)
+
+  return d
+
+
 def kinematics(m: Model, d: Data) -> Data:
   """Converts position/velocity from generalized coordinates to maximal."""
   if m.impl == Impl.WARP and d.impl == Impl.WARP and mjxw.WARP_INSTALLED:
     from mujoco.mjx.warp import smooth as mjxw_smooth  # pylint: disable=g-import-not-at-top  # pytype: disable=import-error
+
     return mjxw_smooth.kinematics(m, d)
 
+  scalar_joints = np.isin(m.jnt_type, (JointType.HINGE, JointType.SLIDE))
+  traced_model = any(
+      isinstance(leaf, jax.core.Tracer) for leaf in jax.tree_util.tree_leaves(m)
+  )
+  if (
+      not traced_model
+      and m.njnt > 0
+      and np.max(m.body_jntnum) <= 1
+      and np.all(scalar_joints)
+  ):
+    return _kinematics_fixed_scalar_tree(m, d)
 
   def fn(carry, jnt_typs, jnt_pos, jnt_axis, qpos, qpos0, pos, quat):
     # calculate joint anchors, axes, body pos and quat in global frame

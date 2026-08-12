@@ -138,6 +138,89 @@ class SmoothTest(absltest.TestCase):
     )
     _assert_eq(moment, dx._impl.actuator_moment, 'actuator_moment')
 
+  def test_fixed_scalar_tree_kinematics(self):
+    model = mujoco.MjModel.from_xml_string("""
+        <mujoco>
+          <worldbody>
+            <body pos="0.2 -0.1 0.3" euler="0.1 -0.2 0.3">
+              <geom type="sphere" size="0.03"/>
+              <body pos="0.1 0.2 -0.1" euler="-0.2 0.1 0.15">
+                <joint type="hinge" ref="0.2" pos="0.03 -0.02 0.01"
+                       axis="0.2 0.7 -0.4"/>
+                <geom type="sphere" size="0.02"/>
+                <body pos="0.05 -0.1 0.08" euler="0.2 0.1 -0.1">
+                  <site pos="0.08 0.03 -0.02" euler="0.1 0.2 0.3"/>
+                  <body pos="0.04 0.02 0.07" euler="-0.1 0.2 0.1">
+                    <joint type="slide" ref="-0.1" axis="0.4 -0.3 0.8"/>
+                    <geom type="capsule" size="0.02 0.05"/>
+                    <site pos="0.03 -0.02 0.09"/>
+                  </body>
+                  <body pos="-0.02 0.06 0.04" euler="0.3 -0.1 0.2">
+                    <joint type="hinge" axis="-0.6 0.1 0.5"/>
+                    <geom type="cylinder" size="0.02 0.04"/>
+                    <site pos="0.01 0.04 0.05"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+        """)
+    model_mjx = mjx.put_model(model)
+    data_mjx = mjx.make_data(model_mjx)
+    qpos = jp.array((0.73, -0.19, -0.44))
+
+    def outputs(data):
+      return (
+          data.xanchor,
+          data.xaxis,
+          data.xpos,
+          data.xquat,
+          data.xmat,
+          data.xipos,
+          data.ximat,
+          data.geom_xpos,
+          data.geom_xmat,
+          data.site_xpos,
+          data.site_xmat,
+      )
+
+    def fixed_model(qpos):
+      return outputs(mjx.kinematics(model_mjx, data_mjx.replace(qpos=qpos)))
+
+    def dynamic_model(model_mjx, qpos):
+      return outputs(mjx.kinematics(model_mjx, data_mjx.replace(qpos=qpos)))
+
+    actual = jax.jit(fixed_model)(qpos)
+    expected = jax.jit(dynamic_model)(model_mjx, qpos)
+    jax.tree_util.tree_map(
+        lambda actual, expected: _assert_eq(actual, expected, 'kinematics'),
+        actual,
+        expected,
+    )
+
+    def pose_vector(outputs):
+      xpos, xquat, site_xpos, site_xmat = (
+          outputs[2],
+          outputs[3],
+          outputs[9],
+          outputs[10],
+      )
+      return jp.concatenate(
+          tuple(
+              value.reshape(-1) for value in (xpos, xquat, site_xpos, site_xmat)
+          )
+      )
+
+    fixed_poses = lambda qpos: pose_vector(fixed_model(qpos))
+    dynamic_poses = lambda model, qpos: pose_vector(dynamic_model(model, qpos))
+    dynamic_poses = jax.jit(dynamic_poses)
+    expected_jacobian = jax.jacrev(dynamic_poses, argnums=1)(model_mjx, qpos)
+    reverse_jacobian = jax.jacrev(jax.jit(fixed_poses))(qpos)
+    forward_jacobian = jax.jacfwd(jax.jit(fixed_poses))(qpos)
+    _assert_eq(reverse_jacobian, expected_jacobian, 'reverse Jacobian')
+    _assert_eq(forward_jacobian, expected_jacobian, 'forward Jacobian')
+
   def test_disable_gravity(self):
     m = mujoco.MjModel.from_xml_string("""
         <mujoco>
