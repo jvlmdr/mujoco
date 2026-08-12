@@ -138,6 +138,150 @@ def kinematics(m: Model, d: Data) -> Data:
   return d
 
 
+def frame_pose(
+    m: Model,
+    d: Data,
+    obj_type: mujoco.mjtObj,
+    obj_id: int,
+) -> tuple[jax.Array, jax.Array]:
+  """Returns the world position and quaternion of one body or site.
+
+  Only the selected frame's ancestor bodies are evaluated. `obj_type` and
+  `obj_id` describe model structure and must be static under JAX transforms.
+  `mjOBJ_BODY` denotes the inertial frame and `mjOBJ_XBODY` the regular frame.
+  """
+  if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):
+    raise ValueError('frame_pose requires JAX backend implementation.')
+
+  # resolve the output frame to a body and fixed local transform
+  if obj_type in (mujoco.mjtObj.mjOBJ_BODY, mujoco.mjtObj.mjOBJ_XBODY):
+    if not 0 <= obj_id < m.nbody:
+      raise ValueError(f'body id must be in [0, {m.nbody}), got {obj_id}')
+    body_id = obj_id
+    if obj_type == mujoco.mjtObj.mjOBJ_BODY:
+      frame_pos = m.body_ipos[obj_id]
+      frame_quat = m.body_iquat[obj_id]
+    else:
+      frame_pos = None
+      frame_quat = None
+  elif obj_type == mujoco.mjtObj.mjOBJ_SITE:
+    if not 0 <= obj_id < m.nsite:
+      raise ValueError(f'site id must be in [0, {m.nsite}), got {obj_id}')
+    body_id = int(m.site_bodyid[obj_id])
+    frame_pos = m.site_pos[obj_id]
+    frame_quat = m.site_quat[obj_id]
+  else:
+    raise ValueError('frame_pose supports body and site frames')
+
+  # collect ancestor bodies in world-to-frame order
+  body_ids = []
+  while body_id:
+    body_ids.append(body_id)
+    body_id = int(m.body_parentid[body_id])
+  body_ids.reverse()
+
+  body_ids = np.asarray(body_ids, dtype=np.int32)
+  body_pos = m.body_pos[body_ids]
+  body_quat = m.body_quat[body_ids]
+
+  # substitute runtime mocap poses for model poses
+  if m.nmocap:
+    mocap_ids = m.body_mocapid[body_ids]
+    is_mocap = mocap_ids >= 0
+    mocap_ids = np.maximum(mocap_ids, 0)
+    mocap_quat = jax.vmap(math.normalize)(d.mocap_quat[mocap_ids])
+    body_pos = jp.where(is_mocap[:, None], d.mocap_pos[mocap_ids], body_pos)
+    body_quat = jp.where(is_mocap[:, None], mocap_quat, body_quat)
+
+  # arrange each body's joints into a rectangular table for vmap
+  joint_counts = m.body_jntnum[body_ids]
+  max_joints = int(np.max(joint_counts, initial=0))
+  if max_joints:
+    slots = np.arange(max_joints)
+    joint_active = slots < joint_counts[:, None]
+    joint_ids = m.body_jntadr[body_ids, None] + slots
+    joint_ids = np.where(joint_active, joint_ids, 0)
+    qpos_adrs = m.jnt_qposadr[joint_ids]
+    qpos = jp.pad(d.qpos, (0, 6))
+
+    def apply_joint(carry, joint):
+      pos, quat = carry
+      kind, joint_pos, joint_axis, qpos_adr, qpos0 = joint
+      local_qpos = jax.lax.dynamic_slice_in_dim(qpos, qpos_adr, 7)
+
+      def free(_):
+        return local_qpos[:3], math.normalize(local_qpos[3:7])
+
+      def ball(_):
+        anchor = math.rotate(joint_pos, quat) + pos
+        next_quat = math.quat_mul(quat, math.normalize(local_qpos[:4]))
+        next_pos = anchor - math.rotate(joint_pos, next_quat)
+        return next_pos, next_quat
+
+      def slide(_):
+        axis = math.rotate(joint_axis, quat)
+        next_pos = pos + axis * (local_qpos[0] - qpos0)
+        return next_pos, quat
+
+      def hinge(_):
+        anchor = math.rotate(joint_pos, quat) + pos
+        angle = local_qpos[0] - qpos0
+        qloc = math.axis_angle_to_quat(joint_axis, angle)
+        next_quat = math.quat_mul(quat, qloc)
+        next_pos = anchor - math.rotate(joint_pos, next_quat)
+        return next_pos, next_quat
+
+      return jax.lax.switch(kind, (free, ball, slide, hinge), operand=None)
+
+    # apply joints in model order to obtain one local pose per body
+    def local_pose(body):
+      pos, quat, kinds, poss, axes, adrs, qpos0, active = body
+      for slot in range(max_joints):
+        joint = (
+            kinds[slot],
+            poss[slot],
+            axes[slot],
+            adrs[slot],
+            qpos0[slot],
+        )
+        pos, quat = jax.lax.cond(
+            active[slot],
+            lambda carry: apply_joint(carry, joint),
+            lambda carry: carry,
+            (pos, quat),
+        )
+      return pos, quat
+
+    bodies = (
+        body_pos,
+        body_quat,
+        jp.asarray(m.jnt_type[joint_ids], dtype=jp.int32),
+        m.jnt_pos[joint_ids],
+        m.jnt_axis[joint_ids],
+        jp.asarray(qpos_adrs, dtype=jp.int32),
+        m.qpos0[qpos_adrs],
+        jp.asarray(joint_active),
+    )
+    local_pos, local_quat = jax.vmap(local_pose)(bodies)
+  else:
+    local_pos, local_quat = body_pos, body_quat
+
+  # compose the ancestor poses from world to frame
+  def step(carry, local):
+    pos, quat = carry
+    local_pos, local_quat = local
+    pos = pos + math.rotate(local_pos, quat)
+    quat = math.quat_mul(quat, local_quat)
+    return (pos, quat), None
+
+  initial = (jp.zeros(3), jp.array([1.0, 0.0, 0.0, 0.0]))
+  (pos, quat), _ = jax.lax.scan(step, initial, (local_pos, local_quat))
+  if frame_pos is not None:
+    pos = pos + math.rotate(frame_pos, quat)
+    quat = math.quat_mul(quat, frame_quat)
+  return pos, quat
+
+
 def com_pos(m: Model, d: Data) -> Data:
   """Maps inertias and motion dofs to global frame centered at subtree-CoM."""
   if not isinstance(m._impl, ModelJAX) or not isinstance(d._impl, DataJAX):

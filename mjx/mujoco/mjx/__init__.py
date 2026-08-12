@@ -46,6 +46,7 @@ from mujoco.mjx._src.smooth import com_pos
 from mujoco.mjx._src.smooth import com_vel
 from mujoco.mjx._src.smooth import crb
 from mujoco.mjx._src.smooth import factor_m
+from mujoco.mjx._src.smooth import frame_pose
 from mujoco.mjx._src.smooth import kinematics
 from mujoco.mjx._src.smooth import rne
 from mujoco.mjx._src.smooth import rne_postconstraint
